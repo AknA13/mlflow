@@ -9,7 +9,6 @@ from mlflow.protos.databricks_pb2 import (
     RESOURCE_ALREADY_EXISTS,
     ErrorCode,
 )
-from mlflow.store._unity_catalog.registry.rest_store import UcModelRegistryStore
 from mlflow.store.model_registry.rest_store import RestStore
 from mlflow.utils.databricks_utils import get_databricks_host_creds
 from mlflow.utils.logging_utils import eprint
@@ -116,6 +115,10 @@ class DatabricksWorkspaceModelRegistryRestStore(RestStore):
             the cloned model version.
         """
         if dst_name.count(".") == 2:
+            # Imported lazily to avoid a circular import: mlflow.tracking._model_registry.utils
+            # imports this module at the top level.
+            from mlflow.tracking._model_registry.utils import _get_databricks_uc_rest_store
+
             source_uri = f"models:/{src_mv.name}/{src_mv.version}"
             try:
                 local_model_dir = mlflow.artifacts.download_artifacts(
@@ -131,7 +134,7 @@ class DatabricksWorkspaceModelRegistryRestStore(RestStore):
                     f"exist and that you can download them via "
                     f"mlflow.artifacts.download_artifacts()"
                 ) from e
-            uc_store = UcModelRegistryStore(
+            uc_store = _get_databricks_uc_rest_store(
                 store_uri=_DATABRICKS_UNITY_CATALOG_SCHEME,
                 tracking_uri=self.tracking_uri,
             )
