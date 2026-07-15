@@ -1,13 +1,21 @@
 import json
 from itertools import combinations
 from unittest import mock
+from unittest.mock import ANY
 
+import pandas as pd
 import pytest
 import yaml
+from requests import Response
 
+from mlflow.data.dataset import Dataset
+from mlflow.data.delta_dataset_source import DeltaDatasetSource
+from mlflow.data.pandas_dataset import PandasDataset
 from mlflow.entities.logged_model import LoggedModel
 from mlflow.entities.logged_model_tag import LoggedModelTag
 from mlflow.entities.model_registry import (
+    ModelVersion,
+    ModelVersionTag,
     RegisteredModelTag,
 )
 from mlflow.entities.model_registry.prompt import Prompt
@@ -15,6 +23,7 @@ from mlflow.entities.model_registry.prompt_version import PromptVersion
 from mlflow.entities.run import Run
 from mlflow.entities.run_data import RunData
 from mlflow.entities.run_info import RunInfo
+from mlflow.entities.run_inputs import RunInputs
 from mlflow.entities.run_tag import RunTag
 from mlflow.exceptions import MlflowException, RestException
 from mlflow.models.model import MLMODEL_FILE_NAME
@@ -26,8 +35,16 @@ from mlflow.prompt.constants import (
     PROMPT_TYPE_TEXT,
     RESPONSE_FORMAT_TAG_KEY,
 )
+from mlflow.protos.databricks_pb2 import INTERNAL_ERROR, RESOURCE_DOES_NOT_EXIST
 from mlflow.protos.databricks_uc_registry_messages_pb2 import (
+    AwsCredentials,
     DeploymentJobConnection,
+    ModelVersion,
+    StorageMode,
+    TemporaryCredentials,
+    UcCreateModelVersion,
+    UcListModelVersionsResponse,
+    UcModelVersionInfo,
     UcRegisteredModelInfo,
 )
 from mlflow.protos.unity_catalog_prompt_messages_pb2 import (
@@ -36,17 +53,27 @@ from mlflow.protos.unity_catalog_prompt_messages_pb2 import (
     LinkPromptVersionsToRunsRequest,
 )
 from mlflow.store._unity_catalog.registry.enriched_rest_store import (
+    _DATABRICKS_ORG_ID_HEADER,
     UcEnrichedModelRegistryStore,
 )
+from mlflow.store.artifact.optimized_s3_artifact_repo import OptimizedS3ArtifactRepository
+from mlflow.store.artifact.presigned_url_artifact_repo import PresignedUrlArtifactRepository
 from mlflow.tracing.constant import TraceTagKey
 from mlflow.types.schema import ColSpec, DataType
 from mlflow.utils._unity_catalog_utils import (
     _ACTIVE_CATALOG_QUERY,
     _ACTIVE_SCHEMA_QUERY,
+    get_artifact_repo_from_storage_info,
+)
+from mlflow.utils.mlflow_tags import (
+    MLFLOW_DATABRICKS_JOB_ID,
+    MLFLOW_DATABRICKS_JOB_RUN_ID,
+    MLFLOW_DATABRICKS_NOTEBOOK_ID,
 )
 from mlflow.utils.proto_json_utils import message_to_json
 
 from tests.helper_functions import mock_http_200
+from tests.resources.data.dataset_source import SampleDatasetSource
 from tests.store._unity_catalog.conftest import (
     _REGISTRY_HOST_CREDS,
 )
@@ -377,6 +404,13 @@ def langchain_local_model_dir_no_dependencies(tmp_path):
     return tmp_path
 
 
+def test_create_model_version_nonexistent_directory(store, tmp_path):
+    fake_directory = str(tmp_path.joinpath("myfakepath"))
+    with pytest.raises(
+        MlflowException,
+        match="Unable to download model artifacts from source artifact location",
+    ):
+        store.create_model_version(name="mymodel", source=fake_directory)
 
 
 _TEST_SIGNATURE = ModelSignature(
@@ -397,24 +431,171 @@ def feature_store_local_model_dir(tmp_path):
     return tmp_path
 
 
+def test_create_model_version_fails_fs_packaged_model(store, feature_store_local_model_dir):
+    with pytest.raises(
+        MlflowException,
+        match="This model was packaged by Databricks Feature Store and can only be registered on "
+        "a Databricks cluster.",
+    ):
+        store.create_model_version(name="model_1", source=str(feature_store_local_model_dir))
 
 
+def test_create_model_version_missing_mlmodel(store, tmp_path):
+    with pytest.raises(
+        MlflowException,
+        match="Unable to load model metadata. Ensure the source path of the model "
+        "being registered points to a valid MLflow model directory ",
+    ):
+        store.create_model_version(name="mymodel", source=str(tmp_path))
 
 
+def test_create_model_version_missing_signature(store, tmp_path):
+    tmp_path.joinpath(MLMODEL_FILE_NAME).write_text(json.dumps({"a": "b"}))
+    with pytest.raises(
+        MlflowException,
+        match="Model passed for registration did not contain any signature metadata",
+    ):
+        store.create_model_version(name="mymodel", source=str(tmp_path))
 
 
+def test_create_model_version_missing_output_signature(store, tmp_path):
+    fake_signature = ModelSignature(inputs=Schema([ColSpec(DataType.integer)]))
+    fake_mlmodel_contents = {"signature": fake_signature.to_dict()}
+    with open(tmp_path.joinpath(MLMODEL_FILE_NAME), "w") as handle:
+        yaml.dump(fake_mlmodel_contents, handle)
+    with pytest.raises(
+        MlflowException,
+        match="Model passed for registration contained a signature that includes only inputs",
+    ):
+        store.create_model_version(name="mymodel", source=str(tmp_path))
 
 
+@pytest.mark.parametrize("bypass", [True, False])
+def test_create_model_version_optional_signature_validation(store, tmp_path, bypass):
+    # Mock the post-name-resolution create flow so the test isolates the signature-validation
+    # decision. A three-level name is used because the native create flow rejects non-UC names
+    # before issuing the UcCreateModelVersion request.
+    store.spark = None
+    mock_mv = mock.Mock(version="1", storage_location="s3://blah/loc")
+    rest_store = "mlflow.store._unity_catalog.registry.enriched_rest_store"
+    with (
+        mock.patch.object(store, "_validate_model_signature") as mock_validate_signature,
+        mock.patch.object(store, "_local_model_dir") as mock_local_model_dir,
+        mock.patch.object(store, "_download_model_weights_if_not_saved"),
+        mock.patch(f"{rest_store}.get_feature_dependencies", return_value=""),
+        mock.patch(f"{rest_store}.get_model_version_dependencies", return_value=[]),
+        mock.patch.object(store, "_edit_endpoint_and_call", return_value=mock_mv),
+        mock.patch.object(store, "_get_artifact_repo"),
+        mock.patch(f"{rest_store}.model_version_from_uc_proto", return_value=mock.Mock()),
+    ):
+        mock_local_model_dir.return_value.__enter__.return_value = tmp_path
+        mock_local_model_dir.return_value.__exit__.return_value = None
+
+        store._create_model_version_with_optional_signature_validation(
+            name="catalog.schema.test_model",
+            source=str(tmp_path),
+            bypass_signature_validation=bypass,
+        )
+
+    if bypass:
+        mock_validate_signature.assert_not_called()
+    else:
+        mock_validate_signature.assert_called_once_with(tmp_path)
 
 
+def test_get_logged_model_from_model_id_returns_none_on_resource_not_found(store):
+    with mock.patch(
+        "mlflow.get_logged_model",
+        side_effect=MlflowException("Node ID does not exist", error_code=RESOURCE_DOES_NOT_EXIST),
+    ):
+        result = store._get_logged_model_from_model_id("nonexistent_model_id")
+        assert result is None
 
 
+def test_get_logged_model_from_model_id_returns_logged_model_on_success(store):
+    mock_logged_model = LoggedModel(
+        experiment_id="exp123",
+        model_id="model123",
+        name="test_model",
+        artifact_location="runs:/run123/model",
+        source_run_id="run123",
+        creation_timestamp=1234567890,
+        last_updated_timestamp=1234567890,
+    )
+    with mock.patch("mlflow.get_logged_model", return_value=mock_logged_model):
+        result = store._get_logged_model_from_model_id("model123")
+        assert result == mock_logged_model
 
 
+def test_get_logged_model_from_model_id_returns_none_for_none_input(store):
+    result = store._get_logged_model_from_model_id(None)
+    assert result is None
 
 
+def test_get_logged_model_from_model_id_reraises_other_exceptions(store):
+    with mock.patch(
+        "mlflow.get_logged_model",
+        side_effect=MlflowException("Some other error", error_code=INTERNAL_ERROR),
+    ):
+        with pytest.raises(MlflowException, match="Some other error"):
+            store._get_logged_model_from_model_id("model123")
 
 
+@pytest.mark.parametrize(
+    ("flavor_config", "should_persist_api_called"),
+    [
+        # persist_pretrained_model should NOT be called for non-transformer models
+        (
+            {
+                "python_function": {},
+                "scikit-learn": {},
+            },
+            False,
+        ),
+        # persist_pretrained_model should NOT be called if model weights are saved locally
+        (
+            {
+                "transformers": {
+                    "model_binary": "model",
+                    "source_model_name": "SOME_REPO",
+                }
+            },
+            False,
+        ),
+        # persist_pretrained_model should be called if model weights are not saved locally
+        (
+            {
+                "transformers": {
+                    "source_model_name": "SOME_REPO",
+                    "source_model_revision": "SOME_COMMIT_HASH",
+                }
+            },
+            True,
+        ),
+    ],
+)
+def test_download_model_weights_if_not_saved(
+    flavor_config, should_persist_api_called, store, tmp_path
+):
+    fake_mlmodel_contents = {
+        "artifact_path": "some-artifact-path",
+        "run_id": "abc123",
+        "flavors": flavor_config,
+        "signature": _TEST_SIGNATURE.to_dict(),
+    }
+    with tmp_path.joinpath(MLMODEL_FILE_NAME).open("w") as handle:
+        yaml.dump(fake_mlmodel_contents, handle)
+
+    if model_binary_path := flavor_config.get("transformers", {}).get("model_binary"):
+        tmp_path.joinpath(model_binary_path).mkdir()
+
+    with mock.patch("mlflow.transformers") as transformers_mock:
+        store._download_model_weights_if_not_saved(str(tmp_path))
+
+        if should_persist_api_called:
+            transformers_mock.persist_pretrained_model.assert_called_once_with(str(tmp_path))
+        else:
+            transformers_mock.persist_pretrained_model.assert_not_called()
 
 
 def test_search_registered_models_invalid_args(store):
@@ -449,40 +630,222 @@ def test_get_latest_versions_unsupported(store):
         store.get_latest_versions(name=name, stages=["Production"])
 
 
+def test_get_notebook_id_returns_none_if_empty_run(store):
+    assert store._get_notebook_id(None) is None
 
 
+def test_get_notebook_id_returns_expected_id(store):
+    test_tag = RunTag(key=MLFLOW_DATABRICKS_NOTEBOOK_ID, value="123")
+    test_run_data = RunData(tags=[test_tag])
+    test_run_info = RunInfo(
+        "run_uuid",
+        "experiment_id",
+        "user_id",
+        "status",
+        "start_time",
+        "end_time",
+        "lifecycle_stage",
+    )
+    test_run = Run(run_data=test_run_data, run_info=test_run_info)
+    assert store._get_notebook_id(test_run) == "123"
 
 
+def test_get_job_id_returns_none_if_empty_run(store):
+    assert store._get_job_id(None) is None
 
 
+def test_get_job_id_returns_expected_id(store):
+    test_tag = RunTag(key=MLFLOW_DATABRICKS_JOB_ID, value="123")
+    test_run_data = RunData(tags=[test_tag])
+    test_run_info = RunInfo(
+        "run_uuid",
+        "experiment_id",
+        "user_id",
+        "status",
+        "start_time",
+        "end_time",
+        "lifecycle_stage",
+    )
+    test_run = Run(run_data=test_run_data, run_info=test_run_info)
+    assert store._get_job_id(test_run) == "123"
 
 
+def test_get_job_run_id_returns_none_if_empty_run(store):
+    assert store._get_job_run_id(None) is None
 
 
+def test_get_job_run_id_returns_expected_id(store):
+    test_tag = RunTag(key=MLFLOW_DATABRICKS_JOB_RUN_ID, value="123")
+    test_run_data = RunData(tags=[test_tag])
+    test_run_info = RunInfo(
+        "run_uuid",
+        "experiment_id",
+        "user_id",
+        "status",
+        "start_time",
+        "end_time",
+        "lifecycle_stage",
+    )
+    test_run = Run(run_data=test_run_data, run_info=test_run_info)
+    assert store._get_job_run_id(test_run) == "123"
 
 
+def test_get_workspace_id_returns_none_if_empty_headers(store):
+    assert store._get_workspace_id(None) is None
+    bad_headers = {}
+    assert store._get_workspace_id(bad_headers) is None
 
 
+def test_get_workspace_id_returns_expected_id(store):
+    good_headers = {_DATABRICKS_ORG_ID_HEADER: "123"}
+    assert store._get_workspace_id(good_headers) == "123"
 
 
+@pytest.mark.parametrize(
+    ("status_code", "response_text"),
+    [
+        (403, "{}"),
+        (500, "<html><div>Not real json</div></html>"),
+    ],
+)
+def test_get_run_and_headers_returns_none_if_request_fails(store, status_code, response_text):
+    mock_response = mock.MagicMock(autospec=Response)
+    mock_response.status_code = status_code
+    mock_response.headers = {_DATABRICKS_ORG_ID_HEADER: 123}
+    mock_response.text = response_text
+    with mock.patch(
+        "mlflow.store._unity_catalog.registry.enriched_rest_store.http_request", return_value=mock_response
+    ):
+        assert store._get_run_and_headers(run_id="some_run_id") == (None, None)
 
 
+def test_get_run_and_headers_returns_none_if_tracking_uri_not_databricks(
+    mock_databricks_uc_host_creds, tmp_path
+):
+    with mock.patch("mlflow.utils.databricks_utils.get_databricks_host_creds"):
+        store = UcEnrichedModelRegistryStore(store_uri="databricks-uc", tracking_uri=str(tmp_path))
+        mock_response = mock.MagicMock(autospec=Response)
+        mock_response.status_code = 200
+        mock_response.headers = {_DATABRICKS_ORG_ID_HEADER: 123}
+        mock_response.text = "{}"
+        with mock.patch(
+            "mlflow.store._unity_catalog.registry.enriched_rest_store.http_request",
+            return_value=mock_response,
+        ):
+            assert store._get_run_and_headers(run_id="some_run_id") == (None, None)
 
 
 def _get_workspace_id_for_run(run_id=None):
     return "123" if run_id is not None else None
 
 
+def test_local_model_dir_preserves_uc_volumes_path(tmp_path):
+    store = UcEnrichedModelRegistryStore(store_uri="databricks-uc", tracking_uri="databricks-uc")
+    with (
+        mock.patch(
+            "mlflow.artifacts.download_artifacts", return_value=str(tmp_path)
+        ) as mock_download_artifacts,
+        mock.patch(
+            # Pretend that `tmp_path` is a UC Volumes path
+            "mlflow.store._unity_catalog.registry.enriched_rest_store.is_fuse_or_uc_volumes_uri",
+            return_value=True,
+        ) as mock_is_fuse_or_uc_volumes_uri,
+    ):
+        with store._local_model_dir(source=f"dbfs:{tmp_path}", local_model_path=None):
+            pass
+        mock_download_artifacts.assert_called_once()
+        mock_is_fuse_or_uc_volumes_uri.assert_called_once()
+        assert tmp_path.exists()
 
 
+@pytest.mark.parametrize(
+    ("num_inputs", "expected_truncation_size"),
+    [
+        (1, 1),
+        (10, 10),
+        (11, 10),
+    ],
+)
+def test_input_source_truncation(num_inputs, expected_truncation_size, store):
+    test_notebook_tag = RunTag(key=MLFLOW_DATABRICKS_NOTEBOOK_ID, value="321")
+    test_job_tag = RunTag(key=MLFLOW_DATABRICKS_JOB_ID, value="456")
+    test_job_run_tag = RunTag(key=MLFLOW_DATABRICKS_JOB_RUN_ID, value="789")
+    test_run_data = RunData(tags=[test_notebook_tag, test_job_tag, test_job_run_tag])
+    test_run_info = RunInfo(
+        "run_uuid",
+        "experiment_id",
+        "user_id",
+        "status",
+        "start_time",
+        "end_time",
+        "lifecycle_stage",
+    )
+    source_uri = "test:/my/test/uri"
+    source = SampleDatasetSource._resolve(source_uri)
+    df = pd.DataFrame([1, 2, 3], columns=["Numbers"])
+    input_list = []
+    for count in range(num_inputs):
+        input_list.append(
+            Dataset(
+                source=DeltaDatasetSource(
+                    delta_table_name=f"temp_delta_versioned_with_id_{count}",
+                    delta_table_version=1,
+                    delta_table_id=f"uc_id_{count}",
+                )
+            )
+        )
+        # Let's double up the sources and verify non-Delta Datasets are filtered out
+        input_list.append(
+            Dataset(
+                source=PandasDataset(
+                    df=df,
+                    source=source,
+                    name=f"testname_{count}",
+                )
+            )
+        )
+    assert len(input_list) == num_inputs * 2
+    test_run_inputs = RunInputs(dataset_inputs=input_list)
+    test_run = Run(run_data=test_run_data, run_info=test_run_info, run_inputs=test_run_inputs)
+    filtered_inputs = store._get_lineage_input_sources(test_run)
+    assert len(filtered_inputs) == expected_truncation_size
 
 
+def test_create_model_version_unsupported_fields(store):
+    with pytest.raises(MlflowException, match=_expected_unsupported_arg_error_message("run_link")):
+        store.create_model_version(name="mymodel", source="mysource", run_link="https://google.com")
 
 
+def test_transition_model_version_stage_unsupported(store):
+    name = "model_1"
+    version = "5"
+    expected_error = (
+        f"{_expected_unsupported_method_error_message('transition_model_version_stage')}. "
+        f"We recommend using aliases instead of stages for more flexible model deployment "
+        f"management."
+    )
+    with pytest.raises(
+        MlflowException,
+        match=expected_error,
+    ):
+        store.transition_model_version_stage(
+            name=name, version=version, stage="prod", archive_existing_versions=True
+        )
 
 
+def test_search_model_versions_order_by_unsupported(store):
+    with pytest.raises(MlflowException, match=_expected_unsupported_arg_error_message("order_by")):
+        store.search_model_versions(
+            filter_string="name='model_12'", page_token="fake_page_token", order_by=["name ASC"]
+        )
 
 
+@mock_http_200
+@pytest.mark.parametrize("tags", [None, []])
+def test_default_values_for_tags(store, tags):
+    # No unsupported arg exceptions should be thrown
+    store.create_registered_model(name="model_1", description="description", tags=tags)
+    store.create_model_version(name="mymodel", source="source")
 
 
 @pytest.mark.parametrize("spark_session", ["main"], indirect=True)  # set the catalog name to "main"
@@ -519,8 +882,63 @@ def test_store_ignores_hive_metastore_default_from_spark_session(spark_session, 
     assert native_call.call_args.kwargs["full_name_arg"] == "model_1"
 
 
+def test_store_use_presigned_url_store_when_disabled(monkeypatch):
+    store_package = "mlflow.store._unity_catalog.registry.enriched_rest_store"
+    monkeypatch.setenv("MLFLOW_USE_DATABRICKS_SDK_MODEL_ARTIFACTS_REPO_FOR_UC", "false")
+    monkeypatch.setenv("DATABRICKS_HOST", "my-host")
+    monkeypatch.setenv("DATABRICKS_TOKEN", "my-token")
+
+    uc_store = UcEnrichedModelRegistryStore(store_uri="databricks-uc", tracking_uri="databricks-uc")
+    model_version = ModelVersion(
+        name="catalog.schema.model_1", version="1", storage_location="s3://some/storage/location"
+    )
+    creds = TemporaryCredentials(
+        aws_temp_credentials=AwsCredentials(
+            access_key_id="key", secret_access_key="secret", session_token="token"
+        )
+    )
+    with (
+        mock.patch(
+            f"{store_package}.UcEnrichedModelRegistryStore._get_temporary_model_version_write_credentials",
+            return_value=creds,
+        ) as temp_cred_mock,
+        mock.patch(
+            f"{store_package}.get_artifact_repo_from_storage_info",
+            side_effect=get_artifact_repo_from_storage_info,
+        ) as get_repo_mock,
+    ):
+        aws_store = uc_store._get_artifact_repo(
+            model_version.name, model_version.version, model_version.storage_location
+        )
+
+        assert type(aws_store) is OptimizedS3ArtifactRepository
+        temp_cred_mock.assert_called_once_with(
+            name=model_version.name, version=model_version.version
+        )
+        get_repo_mock.assert_called_once_with(
+            storage_location=model_version.storage_location,
+            scoped_token=creds,
+            base_credential_refresh_def=ANY,
+        )
 
 
+def test_store_use_presigned_url_store_when_enabled(monkeypatch):
+    monkeypatch.setenv("DATABRICKS_HOST", "my-host")
+    monkeypatch.setenv("DATABRICKS_TOKEN", "my-token")
+    monkeypatch.setenv("MLFLOW_USE_DATABRICKS_SDK_MODEL_ARTIFACTS_REPO_FOR_UC", "false")
+    store_package = "mlflow.store._unity_catalog.registry.enriched_rest_store"
+    creds = TemporaryCredentials(storage_mode=StorageMode.DEFAULT_STORAGE)
+    with mock.patch(
+        f"{store_package}.UcEnrichedModelRegistryStore._get_temporary_model_version_write_credentials",
+        return_value=creds,
+    ):
+        uc_store = UcEnrichedModelRegistryStore(store_uri="databricks-uc", tracking_uri="databricks-uc")
+        model_version = ModelVersion(name="catalog.schema.model_1", version="1")
+        presigned_store = uc_store._get_artifact_repo(
+            model_version.name, model_version.version, model_version.storage_location
+        )
+
+    assert type(presigned_store) is PresignedUrlArtifactRepository
 
 
 @mock_http_200
@@ -1157,12 +1575,86 @@ def test_get_registered_model_uses_native_endpoint(store):
     assert result.deployment_job_state == "CONNECTED"
 
 
+def test_get_model_version_uses_native_endpoint(store):
+    native_info = UcModelVersionInfo(
+        model_name="model",
+        catalog_name="catalog",
+        schema_name="schema",
+        version=3,
+        model_id="m-1",
+    )
+    with (
+        mock.patch.object(
+            store, "_edit_endpoint_and_call", return_value=native_info
+        ) as native_call,
+        mock.patch.object(store, "_call_endpoint") as legacy_call,
+    ):
+        result = store.get_model_version("catalog.schema.model", 3)
+    native_call.assert_called_once()
+    legacy_call.assert_not_called()
+    assert result.name == "catalog.schema.model"
+    # MLflow entity version is a string (int64 governance version is stringified).
+    assert result.version == "3"
+    assert result.model_id == "m-1"
 
 
+def test_search_model_versions_uses_native_for_name_filter(store):
+    resp = UcListModelVersionsResponse(
+        model_versions=[
+            UcModelVersionInfo(
+                model_name="model", catalog_name="catalog", schema_name="schema", version=1
+            )
+        ],
+        next_page_token="tok",
+    )
+    with (
+        mock.patch.object(store, "_edit_endpoint_and_call", return_value=resp) as native_call,
+        mock.patch.object(store, "_call_endpoint") as legacy_call,
+    ):
+        result = store.search_model_versions(filter_string="name = 'catalog.schema.model'")
+    native_call.assert_called_once()
+    legacy_call.assert_not_called()
+    assert [mv.name for mv in result] == ["catalog.schema.model"]
+    assert result.token == "tok"
 
 
+@pytest.mark.parametrize(
+    "filter_string",
+    [
+        # run_id search was never supported on UC (the legacy registry rejected it too); only a
+        # `name = '...'` filter maps to the native per-model list endpoint. The unsupported
+        # filter is rejected client-side (in parse_model_name) before any HTTP request, so no
+        # http mock is needed here.
+        "run_id = 'abc'",
+        "source_path = 's3://x'",
+    ],
+)
+def test_search_model_versions_rejects_unsupported_filter(store, filter_string):
+    with pytest.raises(MlflowException, match="name = 'model_name'"):
+        store.search_model_versions(filter_string=filter_string)
 
 
+def test_get_temporary_model_version_write_credentials_uses_native(store):
+    # The temp-credentials passthrough returns a json_inline'd TemporaryCredentials. The request
+    # sends the catalog/schema/model split, the version (int64 -> JSON string), and the
+    # READ_WRITE_MODEL_VERSION operation.
+    creds = TemporaryCredentials(storage_mode=StorageMode.DEFAULT_STORAGE)
+    with (
+        mock.patch.object(store, "_edit_endpoint_and_call", return_value=creds) as native_call,
+        mock.patch.object(store, "_call_endpoint") as legacy_call,
+    ):
+        result = store._get_temporary_model_version_write_credentials("catalog.schema.model", 2)
+    native_call.assert_called_once()
+    legacy_call.assert_not_called()
+    assert result is creds
+    body = json.loads(native_call.call_args.kwargs["req_body"])
+    assert body == {
+        "catalog_name": "catalog",
+        "schema_name": "schema",
+        "model_name": "model",
+        "version": 2,
+        "operation": "READ_WRITE_MODEL_VERSION",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1242,12 +1734,144 @@ def test_rename_registered_model_uses_native(store):
     assert result.name == "catalog.schema.newname"
 
 
+def test_update_model_version_uses_native(store):
+    native_info = UcModelVersionInfo(
+        model_name="model",
+        catalog_name="catalog",
+        schema_name="schema",
+        version=2,
+        comment="new",
+    )
+    with (
+        mock.patch.object(
+            store, "_edit_endpoint_and_call", return_value=native_info
+        ) as native_call,
+        mock.patch.object(store, "_call_endpoint") as legacy_call,
+    ):
+        result = store.update_model_version("catalog.schema.model", 2, "new")
+    native_call.assert_called_once()
+    legacy_call.assert_not_called()
+    assert result.version == "2"
+    assert result.description == "new"
 
 
+def test_create_model_version_uses_native_when_no_dependencies(store, tmp_path):
+    # With the flag on, a three-level name, and no model-version dependencies to translate, the
+    # create + finalize go through the native endpoints; the artifact upload happens in between.
+    native_mv = UcModelVersionInfo(
+        model_name="model",
+        catalog_name="catalog",
+        schema_name="schema",
+        version=1,
+        storage_location="s3://blah",
+        source=str(tmp_path),
+    )
+    mock_repo = mock.MagicMock()
+    with (
+        mock.patch.object(store, "_edit_endpoint_and_call", return_value=native_mv) as native_call,
+        mock.patch.object(store, "_call_endpoint") as legacy_call,
+        mock.patch.object(store, "_get_artifact_repo", return_value=mock_repo),
+        mock.patch.object(store, "_get_logged_model_from_model_id", return_value=None),
+        mock.patch.object(store, "_get_run_and_headers", return_value=(None, None)),
+        mock.patch.object(store, "_get_workspace_id", return_value=None),
+        mock.patch.object(store, "_get_notebook_id", return_value=None),
+        mock.patch.object(store, "_get_job_id", return_value=None),
+        mock.patch.object(store, "_validate_model_signature"),
+        mock.patch.object(store, "_download_model_weights_if_not_saved"),
+        mock.patch(
+            "mlflow.store._unity_catalog.registry.enriched_rest_store.get_feature_dependencies",
+            return_value="",
+        ),
+        mock.patch(
+            "mlflow.store._unity_catalog.registry.enriched_rest_store.get_model_version_dependencies",
+            return_value=[],
+        ),
+        mock.patch.object(store, "_local_model_dir") as local_model_dir,
+    ):
+        local_model_dir.return_value.__enter__.return_value = str(tmp_path)
+        result = store.create_model_version(name="catalog.schema.model", source=str(tmp_path))
+    # create + finalize both go native; the legacy create endpoint is never used.
+    assert native_call.call_count == 2
+    legacy_call.assert_not_called()
+    mock_repo.log_artifacts.assert_called_once()
+    assert result.name == "catalog.schema.model"
+    assert result.version == "1"
 
 
+def test_create_model_version_translates_dependencies_to_governance(store, tmp_path):
+    # The MLflow resource dependencies are translated into the governance DependencyList on the
+    # UcCreateModelVersion request, mirroring the legacy UCMR server: vector-index and table both
+    # become a table securable, UC function a function, UC connection a connection; model-endpoint
+    # (and any other kind) has no governance representation and is dropped.
+    mlflow_deps = [
+        {"type": "DATABRICKS_VECTOR_INDEX", "name": "catalog.schema.index"},
+        {"type": "DATABRICKS_TABLE", "name": "catalog.schema.table"},
+        {"type": "DATABRICKS_UC_FUNCTION", "name": "catalog.schema.fn"},
+        {"type": "DATABRICKS_UC_CONNECTION", "name": "my_connection"},
+        {"type": "DATABRICKS_MODEL_ENDPOINT", "name": "my_endpoint"},
+        {"type": "SOME_UNKNOWN_KIND", "name": "whatever"},
+    ]
+    native_mv = UcModelVersionInfo(
+        model_name="model", catalog_name="catalog", schema_name="schema", version=1
+    )
+    rest_store = "mlflow.store._unity_catalog.registry.enriched_rest_store"
+    with (
+        mock.patch.object(store, "_edit_endpoint_and_call", return_value=native_mv) as native_call,
+        mock.patch.object(store, "_get_artifact_repo", return_value=mock.MagicMock()),
+        mock.patch.object(store, "_get_logged_model_from_model_id", return_value=None),
+        mock.patch.object(store, "_get_run_and_headers", return_value=(None, None)),
+        mock.patch.object(store, "_get_workspace_id", return_value=None),
+        mock.patch.object(store, "_get_notebook_id", return_value=None),
+        mock.patch.object(store, "_get_job_id", return_value=None),
+        mock.patch.object(store, "_validate_model_signature"),
+        mock.patch.object(store, "_download_model_weights_if_not_saved"),
+        mock.patch(f"{rest_store}.get_feature_dependencies", return_value=""),
+        mock.patch(f"{rest_store}.get_model_version_dependencies", return_value=mlflow_deps),
+        mock.patch.object(store, "_local_model_dir") as local_model_dir,
+    ):
+        local_model_dir.return_value.__enter__.return_value = str(tmp_path)
+        store.create_model_version(name="catalog.schema.model", source=str(tmp_path))
+
+    # The first native call is UcCreateModelVersion; inspect its serialized request body.
+    create_call = native_call.call_args_list[0]
+    assert create_call.kwargs["proto_name"] is UcCreateModelVersion
+    body = json.loads(create_call.kwargs["req_body"])
+    deps = body["model_version_dependencies"]["dependencies"]
+    assert deps == [
+        {"table": {"table_full_name": "catalog.schema.index"}},
+        {"table": {"table_full_name": "catalog.schema.table"}},
+        {"function": {"function_full_name": "catalog.schema.fn"}},
+        {"connection": {"connection_name": "my_connection"}},
+    ]
 
 
+def test_create_model_version_omits_dependencies_when_none_supported(store, tmp_path):
+    # When every dependency is an unsupported kind, no DependencyList is attached (the field is
+    # left unset rather than sent as an empty list).
+    mlflow_deps = [{"type": "DATABRICKS_MODEL_ENDPOINT", "name": "my_endpoint"}]
+    native_mv = UcModelVersionInfo(
+        model_name="model", catalog_name="catalog", schema_name="schema", version=1
+    )
+    rest_store = "mlflow.store._unity_catalog.registry.enriched_rest_store"
+    with (
+        mock.patch.object(store, "_edit_endpoint_and_call", return_value=native_mv) as native_call,
+        mock.patch.object(store, "_get_artifact_repo", return_value=mock.MagicMock()),
+        mock.patch.object(store, "_get_logged_model_from_model_id", return_value=None),
+        mock.patch.object(store, "_get_run_and_headers", return_value=(None, None)),
+        mock.patch.object(store, "_get_workspace_id", return_value=None),
+        mock.patch.object(store, "_get_notebook_id", return_value=None),
+        mock.patch.object(store, "_get_job_id", return_value=None),
+        mock.patch.object(store, "_validate_model_signature"),
+        mock.patch.object(store, "_download_model_weights_if_not_saved"),
+        mock.patch(f"{rest_store}.get_feature_dependencies", return_value=""),
+        mock.patch(f"{rest_store}.get_model_version_dependencies", return_value=mlflow_deps),
+        mock.patch.object(store, "_local_model_dir") as local_model_dir,
+    ):
+        local_model_dir.return_value.__enter__.return_value = str(tmp_path)
+        store.create_model_version(name="catalog.schema.model", source=str(tmp_path))
+
+    body = json.loads(native_call.call_args_list[0].kwargs["req_body"])
+    assert "model_version_dependencies" not in body
 
 
 # ---------------------------------------------------------------------------
@@ -1266,6 +1890,15 @@ def test_delete_registered_model_uses_native(store):
     legacy_call.assert_not_called()
 
 
+def test_delete_model_version_uses_native(store):
+    with (
+        mock.patch.object(store, "_edit_endpoint_and_call") as native_call,
+        mock.patch.object(store, "_call_endpoint") as legacy_call,
+    ):
+        store.delete_model_version("catalog.schema.model", 3)
+    native_call.assert_called_once()
+    legacy_call.assert_not_called()
+    assert native_call.call_args.kwargs["version_arg"] == 3
 
 
 
@@ -1290,5 +1923,35 @@ def test_set_registered_model_tag_uses_native_tag_api(store):
     assert body["changes"]["add_tags"] == [{"key": "k", "value": "v"}]
 
 
+def test_set_model_version_tag_uses_native_subentity_tag_api(store):
+    with (
+        mock.patch.object(store, "_edit_endpoint_and_call") as native_call,
+        mock.patch.object(store, "_call_endpoint") as legacy_call,
+    ):
+        store.set_model_version_tag("catalog.schema.model", 2, ModelVersionTag(key="k", value="v"))
+    native_call.assert_called_once()
+    legacy_call.assert_not_called()
+    kwargs = native_call.call_args.kwargs
+    assert kwargs["securable_type"] == "FUNCTION"
+    assert kwargs["securable_full_name"] == "catalog.schema.model"
+    assert kwargs["subentity_name"] == 2
+    body = json.loads(kwargs["req_body"])
+    assert body["changes"]["add_tags"] == [{"key": "k", "value": "v"}]
 
 
+def test_get_model_version_download_uri_native_derives_storage_location(store):
+    native_mv = UcModelVersionInfo(
+        model_name="model",
+        catalog_name="catalog",
+        schema_name="schema",
+        version=1,
+        storage_location="s3://blah/loc",
+    )
+    with (
+        mock.patch.object(store, "_edit_endpoint_and_call", return_value=native_mv) as native_call,
+        mock.patch.object(store, "_call_endpoint") as legacy_call,
+    ):
+        uri = store.get_model_version_download_uri("catalog.schema.model", 1)
+    native_call.assert_called_once()
+    legacy_call.assert_not_called()
+    assert uri == "s3://blah/loc"
