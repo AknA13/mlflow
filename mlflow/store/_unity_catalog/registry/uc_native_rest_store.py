@@ -68,6 +68,7 @@ from mlflow.store.entities.paged_list import PagedList
 from mlflow.utils._unity_catalog_oss_utils import parse_model_name
 from mlflow.utils._unity_catalog_utils import (
     get_full_name_from_sc,
+    split_uc_model_name,
     uc_model_version_status_to_string,
 )
 from mlflow.utils.databricks_utils import _print_databricks_deployment_job_url
@@ -192,20 +193,6 @@ def model_version_search_from_uc_native_proto(
     )
 
 
-def _split_uc_name(full_name):
-    match full_name.split("."):
-        case [catalog, schema, model] if all((catalog, schema, model)):
-            return catalog, schema, model
-        case _:
-            raise MlflowException(
-                f"Not a valid Unity Catalog model name: '{full_name}'. Unity Catalog model names "
-                "must have three levels (catalog.schema.model). If you are trying to use the "
-                "legacy Workspace Model Registry instead of the recommended Unity Catalog Model "
-                "Registry, set the Model Registry URI to 'databricks' (legacy) instead of "
-                "'databricks-uc'."
-            )
-
-
 class UcNativeModelRegistryStore(UcModelRegistryStore):
     """UC model-registry store that routes operations to the native /api/2.1/unity-catalog/*
     endpoints. See the module docstring for details.
@@ -245,7 +232,7 @@ class UcNativeModelRegistryStore(UcModelRegistryStore):
 
     def create_registered_model(self, name, tags=None, description=None, deployment_job_id=None):
         full_name = get_full_name_from_sc(name, self.spark)
-        catalog, schema, model = _split_uc_name(full_name)
+        catalog, schema, model = split_uc_model_name(full_name)
         req_body = message_to_json(
             CreateRegisteredModel(
                 name=model,
@@ -402,7 +389,7 @@ class UcNativeModelRegistryStore(UcModelRegistryStore):
     # CRUD API for ModelVersion objects
 
     def _get_temporary_model_version_write_credentials(self, name, version) -> TemporaryCredentials:
-        catalog, schema, model = _split_uc_name(name)
+        catalog, schema, model = split_uc_model_name(name)
         req_body = message_to_json(
             GenerateTemporaryModelVersionCredential(
                 catalog_name=catalog,
@@ -439,7 +426,7 @@ class UcNativeModelRegistryStore(UcModelRegistryStore):
         extra_headers,
         local_model_dir,
     ):
-        catalog, schema, model = _split_uc_name(full_name)
+        catalog, schema, model = split_uc_model_name(full_name)
         # MLflow resource dependencies are translated to the governance DependencyList
         # (vector-index/table -> table, UC function -> function, UC connection -> connection;
         # model-endpoint and other kinds have no governance representation and are dropped, as on
