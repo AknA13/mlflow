@@ -492,6 +492,16 @@ MLFLOW_ENABLE_UC_VOLUME_FUSE_ARTIFACT_REPO = _BooleanEnvironmentVariable(
     "MLFLOW_ENABLE_UC_VOLUME_FUSE_ARTIFACT_REPO", True
 )
 
+#: Specifies whether to route Unity Catalog model-registry calls to the native
+#: ``/api/2.1/unity-catalog/*`` enriched endpoints (``UcEnrichedModelRegistryStore``). When
+#: ``False`` (default), the legacy ``/api/2.0/mlflow/unity-catalog/*`` client
+#: (``UcModelRegistryStore``) is used. The native store transparently falls back to the legacy
+#: endpoints when the enriched backend handlers are not yet available.
+#: (default: ``False``)
+MLFLOW_ENABLE_UC_NATIVE_MODEL_REGISTRY = _BooleanEnvironmentVariable(
+    "MLFLOW_ENABLE_UC_NATIVE_MODEL_REGISTRY", False
+)
+
 #: Private environment variable that should be set to ``True`` when running autologging tests.
 #: (default: ``False``)
 _MLFLOW_AUTOLOGGING_TESTING = _BooleanEnvironmentVariable("MLFLOW_AUTOLOGGING_TESTING", False)

@@ -211,6 +211,19 @@ def _get_databricks_rest_store(store_uri, tracking_uri, **_):
     return DatabricksWorkspaceModelRegistryRestStore(store_uri, tracking_uri)
 
 
+def _get_databricks_uc_rest_store(store_uri, tracking_uri=None, **_):
+    from mlflow.environment_variables import MLFLOW_ENABLE_UC_NATIVE_MODEL_REGISTRY
+    from mlflow.store._unity_catalog.registry.rest_store import UcModelRegistryStore
+
+    if MLFLOW_ENABLE_UC_NATIVE_MODEL_REGISTRY.get():
+        from mlflow.store._unity_catalog.registry.enriched_rest_store import (
+            UcEnrichedModelRegistryStore,
+        )
+
+        return UcEnrichedModelRegistryStore(store_uri, tracking_uri)
+    return UcModelRegistryStore(store_uri, tracking_uri)
+
+
 # We define the global variable as `None` so that instantiating the store does not lead to circular
 # dependency issues.
 _model_registry_store_registry = None
@@ -222,7 +235,6 @@ def _get_file_store(store_uri, **_):
 
 def _get_store_registry():
     global _model_registry_store_registry
-    from mlflow.store._unity_catalog.registry.rest_store import UcModelRegistryStore
     from mlflow.store._unity_catalog.registry.uc_oss_rest_store import UnityCatalogOssStore
 
     if _model_registry_store_registry is not None:
@@ -230,9 +242,11 @@ def _get_store_registry():
 
     _model_registry_store_registry = ModelRegistryStoreRegistry()
     _model_registry_store_registry.register("databricks", _get_databricks_rest_store)
-    # Register a placeholder function that raises if users pass a registry URI with scheme
-    # "databricks-uc"
-    _model_registry_store_registry.register(_DATABRICKS_UNITY_CATALOG_SCHEME, UcModelRegistryStore)
+    # Select the legacy /api/2.0 store or the native /api/2.1 enriched store based on
+    # MLFLOW_ENABLE_UC_NATIVE_MODEL_REGISTRY.
+    _model_registry_store_registry.register(
+        _DATABRICKS_UNITY_CATALOG_SCHEME, _get_databricks_uc_rest_store
+    )
     _model_registry_store_registry.register(_OSS_UNITY_CATALOG_SCHEME, UnityCatalogOssStore)
 
     for scheme in ["http", "https"]:

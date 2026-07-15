@@ -1,15 +1,22 @@
 import base64
 
+from mlflow.environment_variables import MLFLOW_ENABLE_UC_NATIVE_MODEL_REGISTRY
 from mlflow.exceptions import MlflowException
 from mlflow.protos.databricks_pb2 import INVALID_PARAMETER_VALUE
 from mlflow.protos.databricks_uc_registry_messages_pb2 import (
     MODEL_VERSION_OPERATION_READ,
+    GenerateTemporaryModelVersionCredential,
     GenerateTemporaryModelVersionCredentialsRequest,
     GenerateTemporaryModelVersionCredentialsResponse,
     ModelVersionLineageDirection,
     StorageMode,
+    TemporaryCredentialOperation,
+    TemporaryCredentials,
 )
-from mlflow.protos.databricks_uc_registry_service_pb2 import UcModelRegistryService
+from mlflow.protos.databricks_uc_registry_service_pb2 import (
+    UcEnrichedModelRegistryService,
+    UcModelRegistryService,
+)
 from mlflow.store._unity_catalog.lineage.constants import _DATABRICKS_LINEAGE_ID_HEADER
 from mlflow.store.artifact.artifact_repo import ArtifactRepository
 from mlflow.store.artifact.databricks_sdk_models_artifact_repo import (
@@ -30,6 +37,7 @@ from mlflow.utils.databricks_utils import get_databricks_host_creds
 from mlflow.utils.proto_json_utils import message_to_json
 from mlflow.utils.rest_utils import (
     _REST_API_PATH_PREFIX,
+    _UC_OSS_REST_API_PATH_PREFIX,
     call_endpoint,
     extract_api_info_for_service,
 )
@@ -40,7 +48,13 @@ from mlflow.utils.uri import (
     is_databricks_unity_catalog_uri,
 )
 
-_METHOD_TO_INFO = extract_api_info_for_service(UcModelRegistryService, _REST_API_PATH_PREFIX)
+_METHOD_TO_INFO = extract_api_info_for_service(
+    UcEnrichedModelRegistryService, _UC_OSS_REST_API_PATH_PREFIX
+)
+# Legacy /api/2.0 endpoint map, used when MLFLOW_ENABLE_UC_NATIVE_MODEL_REGISTRY is off.
+_LEGACY_METHOD_TO_INFO = extract_api_info_for_service(
+    UcModelRegistryService, _REST_API_PATH_PREFIX
+)
 
 
 class UnityCatalogModelsArtifactRepository(ArtifactRepository):
@@ -95,15 +109,61 @@ class UnityCatalogModelsArtifactRepository(ArtifactRepository):
     def _get_blob_storage_path(self):
         return self.client.get_model_version_download_uri(self.model_name, self.model_version)
 
-    def _get_scoped_token(self, lineage_header_info=None):
+    def _lineage_extra_headers(self, lineage_header_info):
         extra_headers = {}
         if lineage_header_info:
             header_json = message_to_json(lineage_header_info)
             header_base64 = base64.b64encode(header_json.encode())
             extra_headers[_DATABRICKS_LINEAGE_ID_HEADER] = header_base64
+        return extra_headers
 
+    def _get_scoped_token(self, lineage_header_info=None):
+        # The native /api/2.1 and legacy /api/2.0 temp-credentials endpoints both forward to the
+        # same managed-catalog credential handler (which reads the lineage header and emits
+        # downstream lineage on READ). MLFLOW_ENABLE_UC_NATIVE_MODEL_REGISTRY selects between them,
+        # mirroring the model-registry store selection.
+        if MLFLOW_ENABLE_UC_NATIVE_MODEL_REGISTRY.get():
+            return self._get_scoped_token_native(lineage_header_info=lineage_header_info)
+        return self._get_scoped_token_legacy(lineage_header_info=lineage_header_info)
+
+    def _get_scoped_token_native(self, lineage_header_info=None):
+        extra_headers = self._lineage_extra_headers(lineage_header_info)
         db_creds = get_databricks_host_creds(self.registry_uri)
-        endpoint, method = _METHOD_TO_INFO[GenerateTemporaryModelVersionCredentialsRequest]
+        match self.model_name.split("."):
+            case [catalog, schema, model] if all((catalog, schema, model)):
+                pass
+            case _:
+                raise MlflowException(
+                    f"Not a valid Unity Catalog model name: '{self.model_name}'. Unity Catalog "
+                    "model names must have three levels (catalog.schema.model).",
+                    error_code=INVALID_PARAMETER_VALUE,
+                )
+        endpoint, method = _METHOD_TO_INFO[GenerateTemporaryModelVersionCredential]
+        req_body = message_to_json(
+            GenerateTemporaryModelVersionCredential(
+                catalog_name=catalog,
+                schema_name=schema,
+                model_name=model,
+                version=int(self.model_version),
+                operation=TemporaryCredentialOperation.Value("READ_MODEL_VERSION"),
+            )
+        )
+        # The passthrough response json_inlines a managed-catalog TemporaryCredentials, so the flat
+        # body parses directly into the proto.
+        response_proto = TemporaryCredentials()
+        return call_endpoint(
+            host_creds=db_creds,
+            endpoint=endpoint,
+            method=method,
+            json_body=req_body,
+            response_proto=response_proto,
+            extra_headers=extra_headers,
+        )
+
+    def _get_scoped_token_legacy(self, lineage_header_info=None):
+        extra_headers = self._lineage_extra_headers(lineage_header_info)
+        db_creds = get_databricks_host_creds(self.registry_uri)
+        endpoint, method = _LEGACY_METHOD_TO_INFO[GenerateTemporaryModelVersionCredentialsRequest]
         req_body = message_to_json(
             GenerateTemporaryModelVersionCredentialsRequest(
                 name=self.model_name,
