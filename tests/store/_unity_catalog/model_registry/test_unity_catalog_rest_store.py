@@ -1901,8 +1901,31 @@ def test_delete_model_version_uses_native(store):
     assert native_call.call_args.kwargs["version_arg"] == 3
 
 
+def test_set_registered_model_alias_uses_native(store):
+    with (
+        mock.patch.object(store, "_edit_endpoint_and_call") as native_call,
+        mock.patch.object(store, "_call_endpoint") as legacy_call,
+    ):
+        store.set_registered_model_alias("catalog.schema.model", "champion", 3)
+    native_call.assert_called_once()
+    legacy_call.assert_not_called()
+    kwargs = native_call.call_args.kwargs
+    assert kwargs["alias_arg"] == "champion"
+    # The request body carries the full name and the version_num (int64, serialized as a
+    # JSON number by mlflow's message_to_json).
+    body = json.loads(kwargs["req_body"])
+    assert body["full_name_arg"] == "catalog.schema.model"
+    assert body["version_num"] == 3
 
 
+def test_delete_registered_model_alias_uses_native(store):
+    with (
+        mock.patch.object(store, "_edit_endpoint_and_call") as native_call,
+        mock.patch.object(store, "_call_endpoint") as legacy_call,
+    ):
+        store.delete_registered_model_alias("catalog.schema.model", "champion")
+    native_call.assert_called_once()
+    legacy_call.assert_not_called()
 
 
 def test_set_registered_model_tag_uses_native_tag_api(store):

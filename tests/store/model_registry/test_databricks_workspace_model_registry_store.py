@@ -159,7 +159,7 @@ def test_copy_model_version_unity_catalog_success(store, sample_model_version):
             "mlflow.artifacts.download_artifacts", return_value="/tmp/local_model_dir"
         ) as mock_download,
         mock.patch(
-            "mlflow.store.model_registry.databricks_workspace_model_registry_rest_store.UcModelRegistryStore"
+            "mlflow.tracking._model_registry.utils._get_databricks_uc_rest_store"
         ) as mock_uc_store_class,
     ):
         mock_uc_store = mock.MagicMock()
@@ -185,7 +185,7 @@ def test_copy_model_version_unity_catalog_success(store, sample_model_version):
 
         result = store.copy_model_version(sample_model_version, dst_name)
 
-        # Verify UcModelRegistryStore was created with correct parameters
+        # Verify the UC store factory was called with correct parameters
         mock_uc_store_class.assert_called_once_with(
             store_uri="databricks-uc", tracking_uri="databricks"
         )
@@ -244,7 +244,7 @@ def test_copy_model_version_unity_catalog_registered_model_already_exists(
             "mlflow.artifacts.download_artifacts", return_value="/tmp/local_model_dir"
         ) as mock_download,
         mock.patch(
-            "mlflow.store.model_registry.databricks_workspace_model_registry_rest_store.UcModelRegistryStore"
+            "mlflow.tracking._model_registry.utils._get_databricks_uc_rest_store"
         ) as mock_uc_store_class,
     ):
         mock_uc_store = mock.MagicMock()
@@ -274,7 +274,7 @@ def test_copy_model_version_unity_catalog_registered_model_already_exists(
 
         result = store.copy_model_version(sample_model_version, dst_name)
 
-        # Verify UcModelRegistryStore was created with correct parameters
+        # Verify the UC store factory was called with correct parameters
         mock_uc_store_class.assert_called_once_with(
             store_uri="databricks-uc", tracking_uri="databricks"
         )
@@ -315,7 +315,7 @@ def test_copy_model_version_unity_catalog_registered_model_creation_failure(
             "mlflow.artifacts.download_artifacts", return_value="/tmp/local_model_dir"
         ) as mock_download,
         mock.patch(
-            "mlflow.store.model_registry.databricks_workspace_model_registry_rest_store.UcModelRegistryStore"
+            "mlflow.tracking._model_registry.utils._get_databricks_uc_rest_store"
         ) as mock_uc_store_class,
     ):
         mock_uc_store = mock.MagicMock()
@@ -328,7 +328,7 @@ def test_copy_model_version_unity_catalog_registered_model_creation_failure(
         with pytest.raises(MlflowException, match="Permission denied"):
             store.copy_model_version(sample_model_version, dst_name)
 
-        # Verify UcModelRegistryStore was created with correct parameters
+        # Verify the UC store factory was called with correct parameters
         mock_uc_store_class.assert_called_once_with(
             store_uri="databricks-uc", tracking_uri="databricks"
         )
@@ -355,7 +355,7 @@ def test_copy_model_version_unity_catalog_signature_validation_bypass(
     with (
         mock.patch("mlflow.artifacts.download_artifacts", return_value="/tmp/local_model_dir"),
         mock.patch(
-            "mlflow.store.model_registry.databricks_workspace_model_registry_rest_store.UcModelRegistryStore"
+            "mlflow.tracking._model_registry.utils._get_databricks_uc_rest_store"
         ) as mock_uc_store_class,
     ):
         mock_uc_store = mock.MagicMock()

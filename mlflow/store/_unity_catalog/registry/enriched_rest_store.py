@@ -1426,6 +1426,87 @@ class UcEnrichedModelRegistryStore(BaseRestStore):
         )
         return
 
+    def set_registered_model_alias(self, name, alias, version):
+        """
+        Set a registered model alias pointing to a model version.
+
+        Args:
+            name: Registered model name.
+            alias: Name of the alias.
+            version: Registered model version number.
+
+        Returns:
+            None
+        """
+        full_name = get_full_name_from_sc(name, self.spark)
+        native_req = message_to_json(
+            SetRegisteredModelAlias(
+                full_name_arg=full_name, alias_arg=alias, version_num=int(version)
+            )
+        )
+        endpoint, method = self._get_endpoint_from_method(SetRegisteredModelAlias)
+        self._edit_endpoint_and_call(
+            endpoint=endpoint,
+            method=method,
+            req_body=native_req,
+            proto_name=SetRegisteredModelAlias,
+            full_name_arg=full_name,
+            alias_arg=alias,
+        )
+        return
+
+    def delete_registered_model_alias(self, name, alias):
+        """
+        Delete an alias associated with a registered model.
+
+        Args:
+            name: Registered model name.
+            alias: Name of the alias.
+
+        Returns:
+            None
+        """
+        full_name = get_full_name_from_sc(name, self.spark)
+        native_req = message_to_json(
+            DeleteRegisteredModelAlias(full_name_arg=full_name, alias_arg=alias)
+        )
+        endpoint, method = self._get_endpoint_from_method(DeleteRegisteredModelAlias)
+        self._edit_endpoint_and_call(
+            endpoint=endpoint,
+            method=method,
+            req_body=native_req,
+            proto_name=DeleteRegisteredModelAlias,
+            full_name_arg=full_name,
+            alias_arg=alias,
+        )
+        return
+
+    def get_model_version_by_alias(self, name, alias):
+        """
+        Get the model version instance by name and alias.
+
+        Args:
+            name: Registered model name.
+            alias: Name of the alias.
+
+        Returns:
+            A single :py:class:`mlflow.entities.model_registry.ModelVersion` object.
+        """
+        full_name = get_full_name_from_sc(name, self.spark)
+        native_req = message_to_json(
+            UcGetModelVersionByAlias(full_name_arg=full_name, alias_arg=alias)
+        )
+        endpoint, method = self._get_endpoint_from_method(UcGetModelVersionByAlias)
+        native_resp = self._edit_endpoint_and_call(
+            endpoint=endpoint,
+            method=method,
+            req_body=native_req,
+            proto_name=UcGetModelVersionByAlias,
+            full_name_arg=full_name,
+            alias_arg=alias,
+        )
+        return model_version_from_uc_proto(native_resp)
+
     def _await_model_version_creation(self, mv, await_creation_for):
         """
         Does not wait for the model version to become READY as a successful creation will

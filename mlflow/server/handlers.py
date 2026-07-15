@@ -492,11 +492,20 @@ class ModelRegistryStoreRegistryWrapper(ModelRegistryStoreRegistry):
 
     @classmethod
     def _get_databricks_uc_rest_store(cls, store_uri):
-        from mlflow.environment_variables import MLFLOW_TRACKING_URI
+        from mlflow.environment_variables import (
+            MLFLOW_ENABLE_UC_NATIVE_MODEL_REGISTRY,
+            MLFLOW_TRACKING_URI,
+        )
         from mlflow.store._unity_catalog.registry.rest_store import UcModelRegistryStore
 
         # Get tracking URI from environment or use "databricks-uc" as default
         tracking_uri = MLFLOW_TRACKING_URI.get() or "databricks-uc"
+        if MLFLOW_ENABLE_UC_NATIVE_MODEL_REGISTRY.get():
+            from mlflow.store._unity_catalog.registry.enriched_rest_store import (
+                UcEnrichedModelRegistryStore,
+            )
+
+            return UcEnrichedModelRegistryStore(store_uri, tracking_uri)
         return UcModelRegistryStore(store_uri, tracking_uri)
 
 
