@@ -24,6 +24,8 @@ from mlflow.protos.databricks_uc_registry_messages_pb2 import (
     ModelVersionLineageInfo,
     SseEncryptionAlgorithm,
     TemporaryCredentials,
+    UcModelVersionInfo,
+    UcRegisteredModelInfo,
 )
 from mlflow.protos.databricks_uc_registry_messages_pb2 import ModelVersion as ProtoModelVersion
 from mlflow.protos.databricks_uc_registry_messages_pb2 import (
@@ -145,6 +147,116 @@ def registered_model_search_from_uc_proto(uc_proto: ProtoRegisteredModel) -> Reg
         description=uc_proto.description,
         aliases=[],
         tags=[],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Converters for the UC-native (enriched) model-registry surface served on
+# ``/api/2.1/unity-catalog/*`` (``UcEnrichedModelRegistryService``).
+#
+# The enriched governance protos (``UcRegisteredModelInfo`` / ``UcModelVersionInfo``) differ
+# from the legacy MLflow-dialect protos above: identity is split into
+# ``catalog_name``/``schema_name``/``model_name`` (vs a single dotted ``name``), versions are
+# typed as ``int64`` (vs string), timestamps/description/user fields are renamed
+# (``created_at``/``updated_at``/``comment``/``created_by``), and aliases carry
+# ``alias_name``/``version_num``.
+# ---------------------------------------------------------------------------
+
+
+def enriched_registered_model_from_uc_proto(uc_proto: UcRegisteredModelInfo) -> RegisteredModel:
+    return RegisteredModel(
+        name=uc_proto.full_name
+        or f"{uc_proto.catalog_name}.{uc_proto.schema_name}.{uc_proto.name}",
+        creation_timestamp=uc_proto.created_at,
+        last_updated_timestamp=uc_proto.updated_at,
+        description=uc_proto.comment,
+        # Governance aliases are {alias_name, version_num}; the MLflow entity expects
+        # {alias, version} with a string version.
+        aliases=[
+            RegisteredModelAlias(alias=alias.alias_name, version=str(alias.version_num))
+            for alias in (uc_proto.aliases or [])
+        ],
+        tags=[RegisteredModelTag(key=tag.key, value=tag.value) for tag in (uc_proto.tags or [])],
+        deployment_job_id=uc_proto.deployment_job_id,
+        deployment_job_state=RegisteredModelDeploymentJobState.to_string(
+            uc_proto.deployment_job_state
+        ),
+    )
+
+
+def enriched_model_version_from_uc_proto(uc_proto: UcModelVersionInfo) -> ModelVersion:
+    return ModelVersion(
+        name=f"{uc_proto.catalog_name}.{uc_proto.schema_name}.{uc_proto.model_name}",
+        # The governance proto types version as int64; the MLflow entity's version is a string
+        # (matching the legacy MLflow-dialect surface, which sent it as a string field).
+        version=str(uc_proto.version),
+        creation_timestamp=uc_proto.created_at,
+        last_updated_timestamp=uc_proto.updated_at,
+        description=uc_proto.comment,
+        user_id=uc_proto.created_by,
+        source=uc_proto.source,
+        run_id=uc_proto.run_id,
+        status=uc_model_version_status_to_string(uc_proto.status),
+        aliases=[alias.alias_name for alias in (uc_proto.aliases or [])],
+        tags=[ModelVersionTag(key=tag.key, value=tag.value) for tag in (uc_proto.tags or [])],
+        model_id=uc_proto.model_id,
+        params=[
+            ModelParam(key=param.name, value=param.value) for param in (uc_proto.model_params or [])
+        ],
+        metrics=[
+            Metric(
+                key=metric.key,
+                value=metric.value,
+                timestamp=metric.timestamp,
+                step=metric.step,
+                dataset_name=metric.dataset_name,
+                dataset_digest=metric.dataset_digest,
+                model_id=metric.model_id,
+                run_id=metric.run_id,
+            )
+            for metric in (uc_proto.model_metrics or [])
+        ],
+        deployment_job_state=ModelVersionDeploymentJobState.from_proto(
+            uc_proto.deployment_job_state
+        ),
+    )
+
+
+def enriched_registered_model_search_from_uc_proto(
+    uc_proto: UcRegisteredModelInfo,
+) -> RegisteredModelSearch:
+    # Search results intentionally omit tags/aliases (RegisteredModelSearch forces them empty).
+    return RegisteredModelSearch(
+        name=uc_proto.full_name
+        or f"{uc_proto.catalog_name}.{uc_proto.schema_name}.{uc_proto.name}",
+        creation_timestamp=uc_proto.created_at,
+        last_updated_timestamp=uc_proto.updated_at,
+        description=uc_proto.comment,
+        aliases=[],
+        tags=[],
+    )
+
+
+def enriched_model_version_search_from_uc_proto(
+    uc_proto: UcModelVersionInfo,
+) -> ModelVersionSearch:
+    # Search results intentionally omit tags/aliases (ModelVersionSearch forces them empty).
+    return ModelVersionSearch(
+        name=f"{uc_proto.catalog_name}.{uc_proto.schema_name}.{uc_proto.model_name}",
+        # int64 governance version -> string entity version (see the model-version converter).
+        version=str(uc_proto.version),
+        creation_timestamp=uc_proto.created_at,
+        last_updated_timestamp=uc_proto.updated_at,
+        description=uc_proto.comment,
+        user_id=uc_proto.created_by,
+        source=uc_proto.source,
+        run_id=uc_proto.run_id,
+        status=uc_model_version_status_to_string(uc_proto.status),
+        aliases=[],
+        tags=[],
+        deployment_job_state=ModelVersionDeploymentJobState.from_proto(
+            uc_proto.deployment_job_state
+        ),
     )
 
 
